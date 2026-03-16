@@ -304,35 +304,141 @@ pg_ctl start
 
 ## 6. Continuous Archiving / PITR
 
-### What
+### What PITR Really Means
 
-PostgreSQL constantly writes every data change to WAL in `pg_wal/`. PITR exploits this:
+**PITR** stands for **Point-In-Time Recovery**. It is PostgreSQL's method of recovering a database cluster to a chosen moment by combining:
 
-- Take one physical baseline (base backup).
-- Keep every WAL change log.
-- Replay until the exact moment you want.
+- a **base backup** — a full physical copy of the whole cluster, and
+- a **continuous WAL archive** — every change recorded after that backup.
+
+The core idea:
 
 ```
-base backup = starting save file
-WAL archive = sequence of moves since then
-recovery target = where you stop replay
+base backup  =  photo of the database
+WAL archive  =  security camera recording every change after the photo
+PITR restore =  start from the photo → replay the recording → stop at 10:32:15
 ```
 
-### Why
-
-PITR is the preferred technique for high reliability:
-- Not just "do I have a copy?" but also "how much data can I lose?" and "how precisely can I recover?"
+This is why PostgreSQL requires a **continuous, unbroken sequence of archived WAL** stretching back to at least the start of the base backup. A gap in WAL means recovery can stop early or fail entirely.
 
 ### Key Distinctions
 
-- `pg_dump` and `pg_dumpall` are **not usable** as part of continuous archiving.
-- PITR restores **whole cluster only** — not selected objects.
+- `pg_dump` / `pg_dumpall` are **not usable** as part of PITR — they are logical backups, not physical ones.
+- PITR always restores the **whole cluster** — not a single database or table.
+- `wal_level = minimal` is **not sufficient** for PITR; use `replica` or higher.
 
-> **Memory aid**: PITR = base backup + WAL + stop point
+### The Overall PITR Lifecycle
+
+```
+Phase A — Prepare backup infrastructure
+  └─ Enable WAL archiving
+  └─ Confirm archived WAL is being stored safely
+  └─ Test that archived WAL can actually be restored
+
+Phase B — Take a base backup
+  └─ pg_basebackup captures a consistent physical cluster snapshot
+  └─ backup_label records the exact starting LSN for recovery
+
+Phase C — Normal operation
+  └─ PostgreSQL keeps generating WAL
+  └─ WAL files continue being archived
+  └─ New base backups taken periodically to reduce future recovery time
+
+Phase D — Restore when disaster happens
+  └─ Stop PostgreSQL on the restore server
+  └─ Replace data directory with the chosen base backup
+  └─ Set restore_command (where to fetch archived WAL from)
+  └─ Set recovery target (where to stop replay)
+  └─ Start PostgreSQL — it replays WAL and stops at the target
+  └─ Promote to read-write on a new timeline
+```
+
+### What Each Component Means
+
+| Component | Role |
+|-----------|------|
+| **Base backup** | Full physical cluster snapshot at a starting moment — the foundation of recovery |
+| **WAL** | Write-Ahead Log records every change in 16 MB segment files — the recording after the photo |
+| **WAL archive** | Safe external storage of past WAL segments — must be complete and continuous |
+| **`backup_label`** | Written into the base backup; records the starting LSN so recovery knows exactly where to begin |
+| **`restore_command`** | Command PostgreSQL runs during recovery to fetch each archived WAL segment back into place |
+| **Recovery target** | The exact stop point: timestamp, restore point, transaction ID, or LSN |
+| **Timeline** | A branch of database history created when recovery ends and the cluster resumes normal operation |
+
+### The Most Important Rule
+
+> **A PITR backup is only as good as its WAL archive continuity.**
+> A pristine base backup with a gap in archived WAL cannot recover past that gap.
+> The only backup that truly matters is one you have actually tested restoring.
+
+### Common Misunderstandings
+
+| Misunderstanding | Reality |
+|-----------------|---------|
+| "I have `pg_dump`, isn't that enough?" | `pg_dump` is logical backup; PITR needs physical base backup + WAL. They solve different problems. |
+| "Can I PITR one table only?" | No — base backup and WAL replay work at whole-cluster level. |
+| "Can I use `wal_level = minimal`?" | No — `minimal` does not contain enough information for point-in-time recovery. |
+| "Can I skip testing and rely on the config?" | Risky. PostgreSQL recommends testing archiving before taking the first base backup. |
+
+### PITR Flow Diagram
+
+```
+Normal operation
+─────────────────
+Client writes data
+      │
+      ▼
+PostgreSQL writes WAL ──── archive_command ────► WAL archive (/backup/archive/)
+      │
+      └──── pg_basebackup at time T0 ──────────► Base backup (/backup/base/)
+
+Disaster recovery
+─────────────────
+Restore base backup (T0) into /var/lib/postgresql/18/main/
+      │
+      ▼
+create recovery.signal  ← tells PostgreSQL to enter archive recovery
+      │
+      ▼
+Start PostgreSQL
+      │
+      ▼
+restore_command fetches WAL segments from /backup/archive/
+      │
+      ▼
+Replay WAL forward from T0
+      │
+      ▼
+Stop at recovery_target_time / restore_point / LSN
+      │
+      ▼
+PostgreSQL removes recovery.signal automatically
+      │
+      ▼
+pg_wal_replay_resume() → database opens on new timeline
+```
+
+> **Memory aid**: `Archive first → Base backup second → Keep WAL → Restore base → Replay WAL → Stop at target`
+> That sequence reflects the real dependency order: WAL archiving must be working *before* a base backup is useful, and restore needs both together.
+
+### Environment Used in All Examples
+
+The same paths are used consistently throughout every subsection below:
+
+| Path | Purpose |
+|------|---------|
+| `/var/lib/postgresql/18/main` | PostgreSQL data directory |
+| `/backup/archive` | WAL archive destination |
+| `/backup/base` | Full base backup destination |
+| `/backup/inc1` | Incremental backup destination |
+| `/backup/combined` | Combined synthetic backup (for incremental restore) |
+| `/var/log/postgresql` | Server log directory |
 
 ---
 
 ### 6.1 Setting Up WAL Archiving
+
+> **Why this step exists**: The base backup alone is not enough for PITR. It is only the starting point. To move forward to any later moment, PostgreSQL must read the WAL records generated *after* that backup. Without a working archive, those records are lost when PostgreSQL recycles old WAL segments.
 
 WAL segment files would normally be recycled. Archiving means **"save each completed segment before PostgreSQL reuses it."**
 
@@ -341,9 +447,19 @@ WAL is split into segment files, normally **16 MB each** (unless changed at `ini
 #### Required Configuration
 
 ```ini
-wal_level = replica          # or higher
+# postgresql.conf
+wal_level = replica          # or higher — replica is sufficient for archiving
 archive_mode = on
-archive_command = 'test ! -f /mnt/server/archivedir/%f && cp %p /mnt/server/archivedir/%f'
+archive_command = 'test ! -f /backup/archive/%f && cp %p /backup/archive/%f'
+```
+
+```bash
+# archive_mode = on requires a full server restart (not just reload)
+pg_ctl restart -D /var/lib/postgresql/18/main
+
+# Verify archiving is active
+psql -c "SELECT pg_switch_wal();"      # force-archive current segment
+ls /backup/archive/                    # one new file should appear
 ```
 
 | Variable | Meaning |
@@ -388,7 +504,9 @@ WAL archiving protects database changes made through SQL. It does **not** restor
 
 ### 6.2 Making a Base Backup
 
-A base backup is the **starting physical copy** for recovery.
+> **Why this step exists**: WAL archiving alone cannot recover a cluster from nothing — you need a starting snapshot to replay WAL *from*. The base backup is that snapshot. It also produces a `backup_label` file recording the exact starting LSN, so recovery knows precisely where to begin reading the WAL archive.
+
+A base backup is the **starting physical copy** for recovery. Without it, WAL replay has no starting frame to build on.
 
 #### Tools
 
@@ -401,11 +519,17 @@ A base backup is the **starting physical copy** for recovery.
 - `max_wal_senders` must be high enough.
 
 ```bash
-# Basic base backup
-pg_basebackup -D /backup/base1
+# Full base backup — tar format, gzip compressed, WAL streamed, progress shown
+# -Ft : tar format  |  -z : gzip  |  -Xs : stream WAL  |  -P : progress
+pg_basebackup -D /backup/base -Ft -z -Xs -P
 
-# Nightly example
-pg_basebackup -D /backups/base_2026_03_10
+# Nightly example: date-stamped destination
+pg_basebackup -D /backup/base_2026_03_10 -Ft -z -Xs -P
+
+# What gets created:
+# /backup/base/base.tar.gz         — cluster data + backup_label
+# /backup/base/pg_wal.tar.gz       — WAL streamed during backup
+# /backup/base/backup_manifest     — list of files + checksums
 ```
 
 #### Backup History File
@@ -439,6 +563,8 @@ The longer the interval between base backups:
 
 ### 6.3 Incremental Backup — PostgreSQL 18
 
+> **Why this step exists**: Full base backups copy every relation block — even blocks unchanged since the last backup. For large databases where most data changes slowly, this wastes time and storage. Incremental backup copies only changed blocks. WAL is still required after combining, so this is an optimization of the base backup step, not a replacement for the full PITR workflow.
+
 PostgreSQL 18 lets `pg_basebackup` make **incremental backups** — copying only changed blocks plus metadata, instead of all relation blocks.
 
 #### Requirements
@@ -450,14 +576,21 @@ PostgreSQL 18 lets `pg_basebackup` make **incremental backups** — copying only
 #### How It Works
 
 ```bash
-# Step 1: Full base backup
-pg_basebackup -D /backup/full0
+# Step 1: Full base backup (same as any normal base backup)
+pg_basebackup -D /backup/base -Ft -z -Xs -P
 
-# Step 2: Incremental backup (provide manifest of prior backup)
-pg_basebackup --incremental=/backup/full0/backup_manifest -D /backup/inc1
+# Step 2: Incremental backup — provide the manifest from the prior backup
+pg_basebackup --incremental=/backup/base/backup_manifest -D /backup/inc1 -Ft -z -Xs -P
 
 # Step 3: Combine into a synthetic full backup before restore
-pg_combinebackup -o /restore/full_synthetic /backup/full0 /backup/inc1
+# Arguments: list prior backups in order from oldest to newest
+pg_combinebackup -o /backup/combined /backup/base /backup/inc1
+
+# Step 4: Restore exactly like a normal base backup — pg_combinebackup output
+# is a plain directory (not tar), so copy directly into the data directory
+rm -rf /var/lib/postgresql/18/main
+cp -a /backup/combined/. /var/lib/postgresql/18/main/
+# Then continue with recovery.signal + restore_command as in section 6.5
 ```
 
 #### Restore Model
@@ -501,24 +634,35 @@ Incremental backup is only possible if replay would begin from a **later checkpo
 
 ### 6.4 Low-Level Base Backup API
 
+> **Why this step exists**: `pg_basebackup` handles entering and leaving backup mode automatically. When you need tighter control — custom copy tools, specific exclusions, or snapshot-system integration — you can drive backup mode manually with `pg_backup_start()` / `pg_backup_stop()`. The same rules apply: write out the returned `backup_label` and `tablespace_map` exactly, and ensure all required WAL has reached the archive before releasing the backup.
+
 The manual workflow behind online physical backup when you need more control than `pg_basebackup`.
 
 #### Steps
 
 ```sql
--- 1. Start backup mode
+-- 1. Start backup mode (keep this connection open until step 3)
 SELECT pg_backup_start(label => 'my_backup', fast => false);
--- The same connection must stay open until backup ends
--- Backup starts at the beginning of a checkpoint
+-- fast => false : waits for normal checkpoint rhythm (less I/O impact)
+-- fast => true  : forces immediate checkpoint (faster start, heavier I/O)
+-- Backup starts at the beginning of the checkpoint
+```
 
--- 2. Copy files (use tar, cpio, rsync, etc.)
--- Normal database activity may continue during this phase
+```bash
+# 2. Copy the cluster data directory while the server is still running
+#    Exclude pg_wal/ — it is handled separately
+tar --exclude=/var/lib/postgresql/18/main/pg_wal \
+    -czf /backup/base/base.tar.gz \
+    /var/lib/postgresql/18/main
+# Normal database activity may continue during this phase
+```
 
--- 3. Stop backup and collect metadata
-SELECT * FROM pg_backup_stop(wait_for_archive => true);
--- Returns: (lsn, labelfile, spcmapfile)
--- Write second field to 'backup_label' byte-for-byte unchanged
--- Write third field (if nonempty) to 'tablespace_map' byte-for-byte unchanged
+```sql
+-- 3. Stop backup and retrieve the metadata (same connection as step 1)
+SELECT lsn, labelfile, spcmapfile FROM pg_backup_stop(wait_for_archive => true);
+-- write labelfile  value → /var/lib/postgresql/18/main/backup_label   (byte-for-byte)
+-- write spcmapfile value → /var/lib/postgresql/18/main/tablespace_map (if non-empty)
+-- wait_for_archive => true ensures all required WAL has reached the archive
 ```
 
 #### Fast Checkpoint Option
@@ -553,6 +697,8 @@ SELECT * FROM pg_backup_stop(wait_for_archive => true);
 
 ### 6.5 Recovering Using a Continuous Archive Backup
 
+> **Why this step exists**: This is the actual PITR restore. The base backup returns the cluster to its state at backup time; WAL replay moves it forward to the chosen target. The base backup alone leaves you "too early" — `restore_command` and the WAL archive are what drive you forward to the exact moment you want.
+
 #### High-Level Steps
 
 1. **Stop the server** if running.
@@ -569,7 +715,7 @@ SELECT * FROM pg_backup_stop(wait_for_archive => true);
 
 ```ini
 # The one absolutely required setting
-restore_command = 'cp /mnt/server/archivedir/%f %p'
+restore_command = 'cp /backup/archive/%f %p'
 # %f = wanted WAL filename
 # %p = destination path inside recovery process
 ```
@@ -600,63 +746,230 @@ You can stop recovery at:
 - A normal recovery to latest may end with a "file not found" message — that is often **normal, not a failure**.
 - If WAL itself is corrupted, recovery halts and you may need an earlier recovery target.
 
+#### Signal Files
+
+PostgreSQL uses signal files — empty marker files placed in the data directory — to decide what startup mode to enter. The server can still start without them, but the behavior is very different:
+
+| Signal file | What PostgreSQL does on startup |
+|-------------|--------------------------------|
+| `recovery.signal` | Enters **targeted archive recovery**. Replays archived WAL, then stops at the `recovery_target` (or when WAL runs out). After completing, PostgreSQL **removes the file automatically** and opens for normal read-write operation. |
+| `standby.signal` | Enters **standby / streaming replica mode**. Keeps replaying WAL continuously from archive and/or primary — never stops on its own. If both files exist, `standby.signal` wins. |
+| *(neither)* | **Normal startup** only. PostgreSQL does ordinary crash recovery if needed, but does **not** enter archive recovery or PITR. |
+
+> **Important nuance**: Without a signal file, PostgreSQL can still do **crash recovery** after an unclean shutdown — that is always automatic. What the signal files control is entry into *archive recovery / PITR*, which is a different, explicit operation.
+
+**Easy mental model**:
+```
+No signal file      →  normal server boot (crash recovery only if needed)
+recovery.signal     →  boot, do PITR / targeted archive recovery, then open writable
+standby.signal      →  boot as standby and keep recovering indefinitely
+```
+
+**PITR startup flow**:
+```
+Restore base backup
+      │
+      ▼
+Create recovery.signal
+      │
+      ▼
+Set restore_command + optional recovery_target
+      │
+      ▼
+pg_ctl start
+      │
+      ▼
+Replay archived WAL
+      │
+      ▼
+Reach recovery target (or WAL exhausted)
+      │
+      ▼
+PostgreSQL removes recovery.signal automatically
+      │
+      ▼
+Database opens read-write on a new timeline
+```
+
 #### Pitfalls
 
 - Restoring files with wrong owner/permissions.
 - Forgetting to remove stale `pg_wal` files from the backup copy.
-- Forgetting `recovery.signal`.
+- Forgetting `recovery.signal` — without it, PostgreSQL starts normally and **skips PITR entirely**.
 - Misreading normal "file not found" end-of-recovery behavior as failure.
 - Choosing a target time inside the backup window.
 
-#### Worked Example: Recovering a Dropped Table
+#### Worked Example: Full End-to-End PITR Scenario
 
-**Scenario**: You accidentally drop a table at 11:30. Data was last known good at 11:00. You have a base backup taken at 09:30 and a WAL archive covering everything since.
+This scenario walks through the **complete lifecycle** — from first-time WAL archiving setup, through taking a base backup, through a disaster, all the way to a verified recovery. All paths follow the environment table defined at the start of Section 6. Every command is shown in sequence so you can follow along or adapt it directly.
 
-**Timeline**:
+**Full Timeline**:
 ```
-09:30  →  pg_basebackup taken
-11:00  →  last INSERT (rows 3 and 4 added)
-11:30  →  DROP TABLE khach_hang  ← disaster
+09:00  →  configure postgresql.conf, pg_hba.conf, restart server  (Phase 1)
+09:15  →  create database, table, insert first 2 rows             (Phase 2)
+09:30  →  pg_basebackup taken                                    (Phase 3)
+11:00  →  INSERT rows 3 and 4, force WAL archive                  (Phase 4)
+11:30  →  DROP TABLE khach_hang  ← disaster                      (Phase 5)
+11:31  →  begin recovery                                         (Phase 6)
 ```
 
-**Step 1 — Stop the server and remove old data:**
+---
+
+##### Phase 1 — Configure PostgreSQL for WAL Archiving (09:00)
+
+###### Step 1.1 — Create the archive directory
+
 ```bash
-pg_ctl stop
-rm -rf /var/lib/pgsql/data
-mkdir /var/lib/pgsql/data
-chmod 700 /var/lib/pgsql/data
+# Create the WAL archive destination and set ownership
+mkdir -p /backup/archive
+chown postgres:postgres /backup/archive
+ls -ld /backup/archive
+# drwxr-xr-x 2 postgres postgres 4096 Mar 15 09:00 /backup/archive
 ```
 
-**Step 2 — Restore the base backup:**
+###### Step 1.2 — Configure `postgresql.conf`
+
 ```bash
-tar -xzf /backup/base.tar.gz -C /var/lib/pgsql/data
+# Edit postgresql.conf (location varies; find it with pg_config or SHOW config_file)
+psql -c "SHOW config_file;"
+# /etc/postgresql/18/main/postgresql.conf
 ```
-At this point you have data as of 09:30 — before the rows at 11:00 and before the DROP.
 
-**Step 3 — Configure recovery in `postgresql.conf`:**
 ```ini
-restore_command = 'cp /backup/archive/%f "%p"'
-recovery_target_time = '2021-06-01 11:00:00'
+# /etc/postgresql/18/main/postgresql.conf — add or update these settings
+wal_level = replica          # minimum required for PITR (minimal is not enough)
+archive_mode = on            # turn on WAL archiving
+archive_command = 'cp %p /backup/archive/%f'
+                             # %p = source WAL file path
+                             # %f = WAL filename only
+                             # test ! -f guards against overwriting existing files
 ```
-`restore_command` tells PostgreSQL where to find the archived WAL files.
-`recovery_target_time` tells it to stop replaying at 11:00 — **after** the inserts, **before** the DROP.
 
-**Step 4 — Clear stale WAL and create the signal file:**
+> **Why `test ! -f` matters**: PostgreSQL may occasionally re-archive the same segment. Without this guard, a re-archive would silently overwrite the already-safe copy, which could corrupt it.
+
+###### Step 1.3 — Configure `pg_hba.conf` for replication connections
+
+`pg_basebackup` uses the replication protocol, so the `postgres` user must be allowed to make replication connections.
+
 ```bash
-rm -rf /var/lib/pgsql/data/pg_wal/*    # stale WAL from the base backup
-touch /var/lib/pgsql/data/recovery.signal
+# Find pg_hba.conf
+psql -c "SHOW hba_file;"
+# /etc/postgresql/18/main/postgresql.conf
 ```
-`recovery.signal` tells PostgreSQL to enter recovery mode on startup.
 
-**Step 5 — Start PostgreSQL:**
+```ini
+# /etc/postgresql/18/main/pg_hba.conf — ensure this line exists
+# TYPE  DATABASE     USER      ADDRESS    METHOD
+local   replication  postgres             trust
+# or for TCP:
+# host  replication  postgres  127.0.0.1/32  trust
+```
+
+###### Step 1.4 — Restart PostgreSQL to apply changes
+
+`archive_mode` requires a **full restart** (not just `reload`) because it changes how the WAL writer initialises.
+
 ```bash
-pg_ctl start
-```
-PostgreSQL replays archived WAL segments one by one, stops at 11:00, and opens normally.
+pg_ctl restart -D /var/lib/postgresql/18/main
 
-**Step 6 — Verify:**
+# Confirm archive_mode is now on
+psql -c "SHOW archive_mode;"
+# archive_mode
+# --------------
+#  on
+
+psql -c "SHOW wal_level;"
+# wal_level
+# -----------
+#  replica
+```
+
+###### Step 1.5 — Verify archiving is working
+
+```sql
+-- Force a WAL segment switch to trigger the archive_command immediately
+SELECT pg_switch_wal();
+--  pg_switch_wal
+-- ---------------
+--  0/2000000
+```
+
+```bash
+# Wait 1-2 seconds, then confirm a segment arrived in the archive
+ls /backup/archive/
+# 000000010000000000000001
+
+# Check pg_stat_archiver for any failures
+psql -c "SELECT last_archived_wal, last_archived_time, failed_count FROM pg_stat_archiver;"
+#  last_archived_wal                 | last_archived_time            | failed_count
+# -----------------------------------+-------------------------------+--------------
+#  000000010000000000000001          | 2026-03-15 09:00:30+00        | 0
+```
+
+`failed_count = 0` means the archive is healthy. If it is non-zero, fix `archive_command` before proceeding — a base backup taken against a broken archive is not useful for PITR.
+
+---
+
+##### Phase 2 — Create the Database and Initial Data (09:15)
+
+```sql
+-- Connect as superuser
+CREATE DATABASE testdb;
+\c testdb
+
+CREATE TABLE khach_hang (
+    id   SERIAL PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+INSERT INTO khach_hang (name) VALUES ('nguyen van a'), ('pham van b');
+
+SELECT * FROM khach_hang;
+-- id | name
+-- ----+--------------
+--   1 | nguyen van a
+--   2 | pham van b
+```
+
+---
+
+##### Phase 3 — Take a Base Backup (09:30)
+
+```bash
+mkdir -p /backup/base
+
+# -Ft  : tar format (produces base.tar.gz and pg_wal.tar.gz)
+# -z   : gzip compression
+# -P   : show progress
+# -Xs  : stream WAL during backup so the backup is self-contained
+pg_basebackup -D /backup/base -Ft -z -Xs -P
+
+# Confirm what was created
+ls /backup/base/
+# base.tar.gz   pg_wal.tar.gz   backup_manifest
+```
+
+`base.tar.gz` contains the entire cluster snapshot **plus a `backup_label` file** recording the exact starting LSN. This LSN is how PostgreSQL will know where to begin WAL replay during recovery.
+
+```bash
+# Preview backup_label to confirm it recorded the start LSN
+tar -xOzf /backup/base/base.tar.gz backup_label
+# START WAL LOCATION: 0/3000028 (file 000000010000000000000003)
+# CHECKPOINT LOCATION: 0/3000060
+# BACKUP METHOD: streamed
+# START TIME: 2026-03-13 09:30:05 UTC
+# LABEL: pg_basebackup base backup
+```
+
+---
+
+##### Phase 4 — Normal Activity: More Inserts (11:00)
+
 ```sql
 \c testdb
+
+INSERT INTO khach_hang (name) VALUES ('nguyen van c'), ('nguyen van d');
+
 SELECT * FROM khach_hang;
 -- id | name
 -- ----+--------------
@@ -665,9 +978,172 @@ SELECT * FROM khach_hang;
 --   3 | nguyen van c
 --   4 | nguyen van d
 ```
-All four rows are restored. The DROP that happened at 11:30 never occurred in this timeline.
 
-> **Key rule**: `recovery_target_time` must be **after** the base backup completed (09:30 here) and **before** the event you want to undo (11:30 DROP). In this case, 11:00 is the safe spot.
+```sql
+-- Force the current WAL segment to be archived immediately,
+-- so the INSERTs above are captured in the archive before we continue.
+SELECT pg_switch_wal();
+-- pg_switch_wal
+-- ---------------
+--  0/4000000
+```
+
+```bash
+# Confirm the new WAL segment appeared in the archive
+ls /backup/archive/
+# 000000010000000000000003  000000010000000000000004
+```
+
+---
+
+##### Phase 5 — The Disaster (11:30)
+
+```sql
+\c testdb
+
+-- Someone accidentally drops the table
+DROP TABLE khach_hang;
+
+-- Confirming it is gone
+\d khach_hang
+-- ERROR:  relation "khach_hang" does not exist
+```
+
+---
+
+##### Phase 6 — Recovery
+
+###### Step 1 — Stop the server and discard the corrupted data directory
+
+```bash
+pg_ctl stop -D /var/lib/postgresql/18/main
+
+# Remove all corrupted data files
+rm -rf /var/lib/postgresql/18/main
+
+# Re-create a clean, empty data directory with correct permissions
+mkdir -p /var/lib/postgresql/18/main
+chmod 700 /var/lib/postgresql/18/main
+chown postgres:postgres /var/lib/postgresql/18/main
+```
+
+###### Step 2 — Restore the base backup
+
+```bash
+# Extract the base backup into the data directory
+tar -xzf /backup/base/base.tar.gz -C /var/lib/postgresql/18/main
+
+# The pg_wal.tar.gz from the backup is intentionally NOT extracted here —
+# we will use the archive instead (see Step 4 note).
+```
+
+At this point the data directory is in the state it was at **09:30** — before the inserts at 11:00 and before the DROP at 11:30.
+
+```bash
+# backup_label is now in the data directory
+cat /var/lib/postgresql/18/main/backup_label
+# START WAL LOCATION: 0/3000028 (file 000000010000000000000003)
+# ...
+```
+
+> **What `backup_label` does**: When PostgreSQL starts in recovery mode, it reads this file to find the **starting LSN** (`0/3000028`). It then requests WAL segments from the archive beginning at exactly that point — no guessing, no scanning.
+
+###### Step 3 — Configure recovery target
+
+```bash
+# Append recovery settings to postgresql.conf
+cat >> /etc/postgresql/18/main/postgresql.conf <<'EOF'
+
+# --- PITR recovery settings ---
+restore_command = 'cp /backup/archive/%f "%p"'
+recovery_target_time = '2026-03-13 11:00:00'
+# Stop AFTER the 11:00 inserts, BEFORE the 11:30 DROP
+EOF
+```
+
+`restore_command` tells PostgreSQL where to fetch each archived WAL segment (`%f` = filename, `%p` = destination path).
+`recovery_target_time` tells it to stop replaying at 11:00 — after the inserts, before the DROP.
+
+###### Step 4 — Clear stale WAL and create the recovery signal
+
+```bash
+# Remove the stale pg_wal/ content that came with the base backup.
+# These files are partial snapshots from the moment the backup was taken
+# and are unreliable. PostgreSQL will fetch the authoritative copies from
+# the archive via restore_command instead.
+rm -rf /var/lib/postgresql/18/main/pg_wal/*
+
+# Create recovery.signal — without this file PostgreSQL would start normally
+# and skip archive recovery entirely. With it, PostgreSQL enters targeted PITR
+# mode, replays WAL up to recovery_target_time, then removes the file itself.
+touch /var/lib/postgresql/18/main/recovery.signal
+```
+
+> **The WAL replay chain**:
+> 1. PostgreSQL reads `backup_label` → finds starting LSN `0/3000028`
+> 2. Calls `restore_command` to fetch `000000010000000000000003` from `/backup/archive/`
+> 3. Replays segment, then fetches the next (`000000010000000000000004`), and so on
+> 4. Stops when it reaches `recovery_target_time = 11:00:00` — after the inserts, before the DROP
+
+###### Step 5 — Start PostgreSQL and watch replay
+
+```bash
+pg_ctl start -D /var/lib/postgresql/18/main -l /var/log/postgresql/recovery.log
+
+# Tail the log to watch WAL replay happen in real time
+tail -f /var/log/postgresql/recovery.log
+```
+
+Expected log output:
+```
+LOG:  starting point-in-time recovery to 2026-03-13 11:00:00+00
+LOG:  restored log file "000000010000000000000003" from archive
+LOG:  redo starts at 0/3000028
+LOG:  consistent recovery state reached at 0/3000100
+LOG:  restored log file "000000010000000000000004" from archive
+LOG:  recovery stopping before commit of transaction 499, time 2026-03-13 11:30:00.123456+00
+LOG:  pausing at the end of recovery
+HINT:  Execute pg_wal_replay_resume() to promote.
+```
+
+The "file not found" message for the next WAL segment after the target is **normal** — it means replay has reached the requested stop point.
+
+###### Step 6 — Verify and promote
+
+```sql
+-- Connect to the recovered instance (read-only until promoted)
+\c testdb
+
+SELECT * FROM khach_hang;
+-- id | name
+-- ----+--------------
+--   1 | nguyen van a
+--   2 | pham van b
+--   3 | nguyen van c  ← restored
+--   4 | nguyen van d  ← restored
+```
+
+All four rows are present. The DROP that happened at 11:30 never occurred in this recovered timeline.
+
+```sql
+-- Promote the server from recovery mode to normal read-write operation.
+-- This removes recovery.signal, starts a new timeline, and allows writes.
+SELECT pg_wal_replay_resume();
+```
+
+```bash
+# Confirm server is now accepting writes
+psql -c "INSERT INTO khach_hang (name) VALUES ('test write');" testdb
+# INSERT 0 1
+```
+
+---
+
+> **Key rules to remember**:
+> - `recovery_target_time` must be **after** the base backup completed (09:30) and **before** the event you want to undo (11:30 DROP).
+> - Always clear stale `pg_wal/` — let `restore_command` supply segments from the archive.
+> - `backup_label` is the anchor: it tells PostgreSQL where WAL replay must start.
+> - After `pg_wal_replay_resume()`, PostgreSQL creates a **new timeline** (see 6.6) to protect this recovered history from future experiments.
 
 ---
 
@@ -714,12 +1190,12 @@ Faster to backup/restore than `pg_dump`, though larger — and simpler than full
 
 ```ini
 # postgresql.conf
-archive_command = 'gzip < %p > /mnt/server/archivedir/%f.gz'
+archive_command = 'gzip < %p > /backup/archive/%f.gz'
 ```
 
 ```ini
 # Recovery
-restore_command = 'gunzip < /mnt/server/archivedir/%f.gz > %p'
+restore_command = 'gunzip < /backup/archive/%f.gz > %p'
 ```
 
 #### Scripted Archive Command
@@ -759,6 +1235,18 @@ archive_command = 'local_backup_script.sh "%p" "%f"'
 - Increasing checkpoint interval parameters can also reduce page-snapshot frequency while keeping `full_page_writes` on.
 
 > **Memory aid**: PITR is powerful, but tablespaces and template DBs are gotcha zones.
+
+---
+
+### 6.9 Best-Practice Mindset
+
+Think of PITR operationally, not as a file-copy exercise:
+
+- **Archive first, base backup second.** Confirm archiving is working and WAL files are arriving in the archive *before* taking the first base backup. A base backup taken against a broken archive is not useful for PITR.
+- **Backups are a recoverability system, not just files.** The system has two assets: base backups and WAL archive continuity. Both must be healthy simultaneously.
+- **Test the restore, not just the backup.** Periodically restore a base backup to a test server and replay WAL to a recent point. If you have never done this, you do not know whether your backup actually works.
+- **Monitor continuously.** Archive failures are silent at first — `pg_wal/` grows quietly until it fills the filesystem and causes a PANIC shutdown. Set up alerting on archive lag.
+- **Keep WAL until you have a tested newer base backup.** Do not delete old archived WAL until you have confirmed the newer base backup can be restored independently.
 
 ---
 
