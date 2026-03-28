@@ -1,6 +1,7 @@
 # ACID Properties
 
 > **Level**: Intermediate | **Tone**: Technical / Teacher-like  
+> **Roadmap**: Phase 5.1 — ACID Properties / Phase 5.3 — Isolation Levels  
 > The four critical properties that every transaction in a relational database must guarantee.
 
 ---

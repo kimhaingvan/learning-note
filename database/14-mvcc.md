@@ -1,6 +1,7 @@
 # Multi-Version Concurrency Control (MVCC)
 
 > **Level**: Intermediate–Advanced | **Tone**: Technical / Teacher-like  
+> **Roadmap**: Phase 5.4 — MVCC  
 > How PostgreSQL allows multiple transactions to read and write the same data concurrently without blocking each other — by keeping multiple versions of every row.
 
 ---

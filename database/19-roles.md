@@ -1,7 +1,10 @@
 # PostgreSQL Database Roles
 
 > **Level**: Intermediate | **Tone**: Technical / Teacher-like  
-> A complete guide to PostgreSQL's unified role system — creating users, groups, granting permissions, membership options (INHERIT/SET), and safely dropping roles.
+> **Roadmap**: Phase 8.1 — Roles & Users / Phase 8.2 — Privileges & GRANT/REVOKE  
+> A complete guide to PostgreSQL's unified role system — creating users, groups, granting permissions, membership options (INHERIT/SET), privileges, and safely dropping roles.
+
+> See also: [12-policy.md](12-policy.md) for Row-Level Security (Phase 8.3).
 
 ---
 
@@ -301,10 +304,211 @@ SET ROLE reporting;     -- ❌ fails
 
 ---
 
+## 8. Privileges Deep Dive
+
+> **Roadmap**: Phase 8.2
+
+### Object Privileges Reference
+
+| Privilege | Applies To | Description |
+|-----------|-----------|-------------|
+| `SELECT` | Tables, views, sequences | Read rows / read current value |
+| `INSERT` | Tables | Insert rows |
+| `UPDATE` | Tables, sequences | Modify rows / advance sequence |
+| `DELETE` | Tables | Delete rows |
+| `TRUNCATE` | Tables | Truncate table |
+| `REFERENCES` | Tables | Create FK constraints |
+| `TRIGGER` | Tables | Create triggers |
+| `CREATE` | Databases, schemas, tablespaces | Create objects inside |
+| `CONNECT` | Databases | Connect to the database |
+| `TEMPORARY` | Databases | Create temp tables |
+| `EXECUTE` | Functions, procedures | Call the function/procedure |
+| `USAGE` | Schemas, sequences, types, domains, FDWs | Access objects in schema / use sequence |
+| `ALL PRIVILEGES` | Any | Shorthand for all applicable privileges |
+
+### Default Privileges
+
+By default, newly created objects are only accessible to the **owner**. `ALTER DEFAULT PRIVILEGES` sets permissions that are **automatically granted** on future objects.
+
+```sql
+-- As the role that will create tables:
+ALTER DEFAULT PRIVILEGES IN SCHEMA app
+    GRANT SELECT ON TABLES TO app_read;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA app
+    GRANT INSERT, UPDATE, DELETE ON TABLES TO app_write;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA app
+    GRANT USAGE, SELECT ON SEQUENCES TO app_write;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA app
+    GRANT EXECUTE ON FUNCTIONS TO app_read;
+```
+
+> **Key detail**: Default privileges apply only to objects created **by the role that ran `ALTER DEFAULT PRIVILEGES`**. If another role creates objects, those defaults don't apply.
+
+```sql
+-- Check current default privileges
+SELECT * FROM pg_default_acl;
+
+-- Or use psql shortcut:
+-- \ddp
+```
+
+### Column-Level Privileges
+
+Grant `SELECT` or `UPDATE` on **specific columns** instead of the whole table.
+
+```sql
+-- Allow app_read to see name and email, but NOT salary or ssn
+GRANT SELECT (id, name, email) ON employees TO app_read;
+
+-- Allow hr_role to update salary only
+GRANT UPDATE (salary) ON employees TO hr_role;
+
+-- Revoke column-level privilege
+REVOKE SELECT (email) ON employees FROM app_read;
+```
+
+```sql
+-- Test: app_read queries employees
+SET ROLE app_read;
+SELECT id, name, email FROM employees;  -- ✅ works
+SELECT salary FROM employees;            -- ❌ ERROR: permission denied for table employees
+SELECT * FROM employees;                 -- ❌ ERROR (because * includes salary)
+```
+
+> **Tip**: Column-level privileges are useful but can be hard to maintain. Consider using **views** to shape accessible data instead — views are often easier to reason about.
+
+### Schema-Level Privileges
+
+| Privilege | What It Means |
+|-----------|---------------|
+| `USAGE` | Can **access** objects in the schema (but still need object-level grants) |
+| `CREATE` | Can **create new objects** in the schema |
+
+```sql
+-- Default: public schema grants USAGE and CREATE to PUBLIC
+-- Secure it:
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
+-- Create an app schema with controlled access
+CREATE SCHEMA app;
+GRANT USAGE ON SCHEMA app TO app_read;
+GRANT USAGE, CREATE ON SCHEMA app TO app_write;
+
+-- Without USAGE, the role cannot see anything in the schema
+-- Without CREATE, the role cannot make new tables/functions
+```
+
+### GRANT with Options
+
+```sql
+-- WITH GRANT OPTION: the grantee can further grant this privilege to others
+GRANT SELECT ON reports TO team_lead WITH GRANT OPTION;
+-- Now team_lead can: GRANT SELECT ON reports TO intern;
+
+-- WITH ADMIN OPTION: for role membership grants
+GRANT app_admin TO alice WITH ADMIN OPTION;
+-- Now alice can: GRANT app_admin TO bob;
+```
+
+### Revoking Privileges
+
+```sql
+-- Revoke specific privilege
+REVOKE INSERT ON orders FROM app_read;
+
+-- Revoke all privileges on a table
+REVOKE ALL ON orders FROM app_read;
+
+-- Revoke GRANT OPTION only (keep the privilege itself)
+REVOKE GRANT OPTION FOR SELECT ON reports FROM team_lead;
+
+-- CASCADE: also revoke from anyone team_lead granted to
+REVOKE SELECT ON reports FROM team_lead CASCADE;
+```
+
+### Inspecting Privileges
+
+```sql
+-- psql shortcuts
+-- \dp tablename        — show table privileges (access privileges)
+-- \dp                  — all tables
+-- \du                  — list roles with attributes
+-- \ddp                 — default privileges
+
+-- SQL query: who has what on a specific table
+SELECT grantee, privilege_type, is_grantable
+FROM information_schema.table_privileges
+WHERE table_name = 'orders'
+  AND table_schema = 'public'
+ORDER BY grantee, privilege_type;
+
+-- Check column-level privileges
+SELECT grantee, column_name, privilege_type
+FROM information_schema.column_privileges
+WHERE table_name = 'employees'
+ORDER BY grantee, column_name;
+
+-- What can a specific role do?
+SELECT * FROM information_schema.role_table_grants
+WHERE grantee = 'app_read';
+```
+
+### Least Privilege Setup Pattern
+
+A complete example for production:
+
+```sql
+-- 1. Lock down public schema
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON DATABASE mydb FROM PUBLIC;
+
+-- 2. Create application schema
+CREATE SCHEMA app;
+
+-- 3. Group roles (permission bundles)
+CREATE ROLE app_read NOLOGIN;
+CREATE ROLE app_write NOLOGIN;
+CREATE ROLE app_admin NOLOGIN;
+
+-- 4. Schema access
+GRANT USAGE ON SCHEMA app TO app_read, app_write;
+GRANT USAGE, CREATE ON SCHEMA app TO app_admin;
+
+-- 5. Default privileges (for objects created by app_admin)
+ALTER DEFAULT PRIVILEGES FOR ROLE app_admin IN SCHEMA app
+    GRANT SELECT ON TABLES TO app_read;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_admin IN SCHEMA app
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_write;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_admin IN SCHEMA app
+    GRANT USAGE, SELECT ON SEQUENCES TO app_write;
+
+-- 6. Login roles
+CREATE ROLE web_app LOGIN PASSWORD 'secure_password';
+GRANT app_write TO web_app;
+GRANT CONNECT ON DATABASE mydb TO web_app;
+
+CREATE ROLE reporting LOGIN PASSWORD 'secure_password';
+GRANT app_read TO reporting;
+GRANT CONNECT ON DATABASE mydb TO reporting;
+
+CREATE ROLE admin LOGIN PASSWORD 'secure_password';
+GRANT app_admin TO admin WITH INHERIT FALSE, SET TRUE;
+GRANT CONNECT ON DATABASE mydb TO admin;
+```
+
+---
+
 ## What to Learn Next
 
-1. **Row-Level Security (RLS)** — Policies that restrict which rows a role can see or modify.
-2. **`pg_hba.conf`** — Host-based authentication that controls *who can connect* from *where*.
-3. **Default privileges** — `ALTER DEFAULT PRIVILEGES` for automatically granting permissions on future objects.
-4. **Schema-level security** — Using `GRANT USAGE ON SCHEMA` and `REVOKE CREATE ON SCHEMA`.
-5. **Audit logging** — Tracking who did what with `pgaudit` extension.
+1. **Row-Level Security (RLS)** — Policies that restrict which rows a role can see or modify — see [12-policy.md](12-policy.md).
+2. **Authentication (`pg_hba.conf`)** — Host-based authentication that controls *who can connect* from *where*.
+3. **SSL/TLS Encryption** — Encrypting client-server connections.
+4. **Audit logging** — Tracking who did what with `pgaudit` extension.
+5. **Security Barrier Views** — Prevent data leakage through views — see [20-views-materialized-views.md](20-views-materialized-views.md).
+
+---
+
+> *Ref: [Docs — Roles](https://www.postgresql.org/docs/18/user-manag.html) · [Docs — Privileges](https://www.postgresql.org/docs/18/ddl-priv.html) · [Docs — GRANT](https://www.postgresql.org/docs/18/sql-grant.html) · [Neon — PostgreSQL Administration](https://neon.com/postgresql/postgresql-administration)*
