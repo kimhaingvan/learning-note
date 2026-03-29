@@ -138,6 +138,70 @@ ROLLBACK;  ❌
 -- Next nextval → 3
 ```
 
+#### Concurrency Guarantees
+
+If two sessions call `nextval()` on the same sequence at the same time, each call is **atomic** — each session gets a **different value**. There is no collision and no "both got the same number" outcome.
+
+```sql
+-- Sequence is at 100. Two concurrent sessions:
+-- Session A: SELECT nextval('my_seq');  → 101
+-- Session B: SELECT nextval('my_seq');  → 102
+-- Even if Session A rolls back, 101 is gone. Next call → 103.
+```
+
+Three important consequences:
+
+| Consequence | Explanation |
+|-------------|-------------|
+| **Increments are not rolled back** | If a transaction gets 101 and later fails, 101 is still consumed. This avoids blocking concurrent transactions. |
+| **Gaps are normal** | Missing numbers appear from rollbacks, failed inserts, or unused cached values. This applies to `SERIAL` / `BIGSERIAL` too, since they are backed by sequences. |
+| **Commit order ≠ sequence order** | A transaction that got 102 might commit before the one that got 101. Sequence values are **unique but not a reliable representation of commit time** — because `nextval()` allocates independently of transaction outcome. |
+
+> **Bottom line**: PostgreSQL sequences are designed for concurrent use — they guarantee **uniqueness**, not gaplessness or transactional rollback of allocated numbers.
+
+#### Example — Full Concurrent Flow
+
+```
+Time ──►
+
+Session A                              Session B
+──────────────────────                 ──────────────────────
+
+BEGIN;
+INSERT INTO orders (id, name)
+VALUES (nextval('order_seq'),          BEGIN;
+        'Order Alpha');
+-- nextval → 101                       INSERT INTO orders (id, name)
+                                       VALUES (nextval('order_seq'),
+                                               'Order Beta');
+                                       -- nextval → 102
+
+                                       COMMIT;  ✅
+                                       -- Row (102, 'Order Beta') is saved
+
+ROLLBACK;  ❌
+-- Row (101, 'Order Alpha') is gone
+-- BUT 101 is NOT returned to the sequence
+
+                                       BEGIN;
+                                       INSERT INTO orders (id, name)
+                                       VALUES (nextval('order_seq'),
+                                               'Order Gamma');
+                                       -- nextval → 103  (not 101!)
+                                       COMMIT;  ✅
+```
+
+**Result in table `orders`**:
+
+| id  | name        |
+|-----|-------------|
+| 102 | Order Beta  |
+| 103 | Order Gamma |
+
+- **101 is missing** — this is a gap caused by Session A's rollback.
+- **102 committed before 101's transaction ended** — commit order ≠ sequence order.
+- **103 follows 102**, skipping 101 — the sequence never goes backward.
+
 ---
 
 ### Step 3 — Read the Current Value
