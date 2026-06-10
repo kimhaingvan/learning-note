@@ -72,7 +72,6 @@ Server hashes incoming key → compares with stored hash
 | Lifetime | Until manually revoked |
 | Rotation | Manual |
 | Generation | Once |
-| Example | `` (Stripe-style) |
 
 ### When to Use
 
@@ -218,6 +217,5 @@ func generateAPIKey(prefix string) (string, error) {
 
 func main() {
     key, _ := generateAPIKey("sk_live_")
-    fmt.Println("API Key:", key)
 }
 ```
