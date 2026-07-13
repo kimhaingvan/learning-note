@@ -390,6 +390,97 @@ This scales cleanly — add `github-client1`, `gitlab-work`, `bitbucket-legacy` 
 
 ---
 
+## SSH Host Alias — Cơ chế hoạt động
+
+Phần `<host>` trong URL `git@<host>:owner/repo.git` **không nhất thiết phải là tên miền thật**. Nó có thể là một alias (Host) định nghĩa trong `~/.ssh/config`.
+
+### Không dùng alias
+
+```bash
+git clone git@github.com:user/repo.git
+```
+
+SSH tìm `Host github.com` trong config → không có → kết nối thẳng tới `github.com` với key mặc định.
+
+### Dùng alias
+
+```
+# ~/.ssh/config
+Host github-work
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/github_work
+    IdentitiesOnly yes
+```
+
+```bash
+git clone git@github-work:user/repo.git
+```
+
+`github-work` không phải domain thật. SSH đọc config, thay thế thành `github.com`, và dùng key `~/.ssh/github_work`.
+
+Tương đương nội bộ:
+
+```bash
+ssh -i ~/.ssh/github_work git@github.com
+```
+
+### Alias có thể đặt tên bất kỳ
+
+```
+Host abc
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/my_key
+```
+
+```bash
+git clone git@abc:project/repo.git   # hoạt động bình thường
+```
+
+### Nhiều alias cùng trỏ về một server
+
+```
+Host github-personal
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/personal
+
+Host github-work
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/work
+```
+
+```bash
+git clone git@github-personal:user/blog.git      # dùng key personal
+git clone git@github-work:company/backend.git     # dùng key work
+```
+
+Cả hai đều kết nối tới `github.com` — chỉ khác private key.
+
+### Luồng xử lý
+
+```
+git@github-work:user/repo.git
+        │
+        ▼
+SSH đọc ~/.ssh/config → tìm Host github-work
+        │
+        ▼
+HostName github.com + IdentityFile ~/.ssh/github_work
+        │
+        ▼
+Kết nối tới github.com bằng key github_work
+        │
+        ▼
+GitHub xác thực bằng public key tương ứng
+```
+
+> **Tóm lại:** `<host>` trong URL SSH là **lookup key** để tìm config block — không bắt buộc phải là hostname thật. SSH alias chỉ là nickname giúp chọn đúng cấu hình và key.
+
+---
+
 ## What Actually Happens on `git commit` + `git push`
 
 ```
